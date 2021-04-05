@@ -1,0 +1,77 @@
+package com.project.FraudDetection
+
+import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.SparkConf
+import org.apache.spark.streaming._
+import org.apache.spark.streaming.kafka010._
+import org.apache.spark.sql._
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.SQLImplicits
+
+object ProcessingKafkaLogs {
+  //Create a class to represent the schema
+  case class TransactionLogs (CustomerID:String, CreditCardNo:Long, TransactionLocation:String, TransactionAmount:Int, TransactionCurrency:String, MerchantName:String, NumberofPasswordTries:Int, TotalCreditLimit:Int, CreditCardCurrency:String )
+
+  def main(args: Array[String]) {
+
+    //validating number of command line arguments.
+  if (args.length < 3) {
+    System.err.println("Please provide <BrokersList> <Consumer group> <Topic> details")
+    System.exit(1)
+    }
+
+    // Create Streaming context with 10 second batch interval
+  val sparkConf = new SparkConf().setAppName("SparkStreamingKafkaFraudAnalysis")
+
+  val ssc = new StreamingContext(sparkConf, Seconds(10))
+//create topic set
+//args(2) is the Kafka topics list
+  val topicsSet = args(2).split(",").toSet
+
+//Create Kafka Parameters required for Spark integration. 
+//args(0) - Kafka brokers list
+//args(1) - Consumer group
+//Provide deserializer class details for both Kafka consumer record key and value.
+  val kafkaParams = Map[String, Object](
+    ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG -> args(0),
+    ConsumerConfig.GROUP_ID_CONFIG -> args(1),
+    ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG -> classOf[StringDeserializer],
+    ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG -> classOf[StringDeserializer])
+
+  //consume the messages from Kafka topic and create DStream
+  val LogsStream =  KafkaUtils.createDirectStream(ssc, LocationStrategies.PreferConsistent, ConsumerStrategies.Subscribe[String, String](topicsSet, kafkaParams))
+  //Get the actual record we need to process. It will be value part of Consumer record
+  val logValues =  LogsStream.map(x => x.value());
+
+    //Collecting the records for window period of 60seconds and sliding interval time 20 seconds
+   val windowedLogsStream = logValues.window(Seconds(60),Seconds(20));
+   
+    //create SQL context object to perform SQL operations
+    val sqlContext = new org.apache.spark.sql.SQLContext(ssc.sparkContext)
+    import sqlContext.implicits._
+
+//Process each RDD of stream and detect fraud.  
+    windowedLogsStream.foreachRDD(
+      rdd =>
+    {
+    //converting RDD in to Dataframe
+    val df = rdd.map(x => x.split(",")).map { c => TransactionLogs(c(0), c(1).trim.toLong, c(2), c(3).trim.toInt, c(4), c(5), c(6).trim.toInt, c(7).trim.toInt, c(8)) }.toDF()
+
+    df.registerTempTable("CustomerTransactionLogs")
+
+    //writing SQL query on Dataframe to detect fraud.
+    val fraudDF = sqlContext.sql("Select CustomerID, CreditCardNo, TransactionAmount, TransactionCurrency, NumberofPasswordTries, TotalCreditLimit, CreditCardCurrency from CustomerTransactionLogs where NumberofPasswordTries > 3 OR TransactionCurrency != CreditCardCurrency OR ( TransactionAmount * 100.0 / TotalCreditLimit ) > 50");
+
+    //display customer details to whom fraud alert has to be sent
+    fraudDF.show();
+    }
+    )
+
+    //Start the Streaming application
+    ssc.start()
+
+    ssc.awaitTermination()
+  }
+
+}
